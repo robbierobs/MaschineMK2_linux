@@ -21,11 +21,8 @@ mod utils;
 
 use std::env;
 use std::path::Path;
-use std::thread;
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-
-use std::time::{Duration, SystemTime};
+use std::net::UdpSocket;
 
 extern crate nix;
 
@@ -39,30 +36,47 @@ extern crate alsa_seq;
 extern crate midi;
 
 use alsa_seq::*;
-use midi::*;
+
 // use devices::mk2::Mikro;
 use handler::MHandler;
 
 mod base;
 mod devices;
 
-use base::{maschine, Maschine, MaschineButton, MaschineHandler};
-use utils::{usage, PAD_RELEASED_BRIGHTNESS};
+use base::Maschine;
+use utils::{find_hidraw, usage, PAD_RELEASED_BRIGHTNESS};
 
 fn main() {
-    let args: Vec<_> = env::args().collect();
+    // Try to find the hidraw device
+    let hidraw_path = match find_hidraw() {
+        Ok(Some(path)) => {
+            println!("Found Maschine device: {}", path);
+            path
+        }
+        Ok(None) => {
+            println!("No Maschine device found.");
+            usage(&env::args().next().unwrap());
+            panic!("missing hidraw device path");
+        }
+        Err(err) => {
+            usage(&env::args().next().unwrap());
+            panic!("error finding hidraw device: {}", err);
+        }
+    };
 
-    if args.len() < 2 {
-        usage(&args[0]);
-        panic!("missing hidraw device path");
-    }
+    // let args: Vec<_> = env::args().collect();
+
+    // if args.len() < 2 {
+    //     usage(&args[0]);
+    //     panic!("missing hidraw device path");
+    // }
 
     let dev_fd = match fcntl::open(
-        Path::new(&args[1]),
+        Path::new(&hidraw_path),
         O_RDWR | O_NONBLOCK,
         sys::stat::Mode::empty(),
     ) {
-        Err(err) => panic!("couldn't open {}: {}", args[1], err.errno().desc()),
+        Err(err) => panic!("couldn't open {}: {}", hidraw_path, err.errno().desc()),
         Ok(file) => file,
     };
 
@@ -84,11 +98,11 @@ fn main() {
     device.clear_screen();
 
     //Trying to draw stuff here
-    if args.len() < 3 {
-        device.write_screen();
-    } else {
-        println!("RUNNING!")
-    }
+    // if args.len() < 3 {
+    //     device.write_screen();
+    // } else {
+    //     println!("RUNNING!")
+    // }
     //println!("{}", std::env::current_dir().unwrap().display());
     for i in 0..16 {
         device.set_pad_light(i, handler.pad_color(), PAD_RELEASED_BRIGHTNESS);
