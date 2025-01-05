@@ -15,22 +15,45 @@
 //  License along with this program.  If not, see
 //  <http://www.gnu.org/licenses/>.
 
-use std::fs::File;
 use std::mem::transmute;
-use std::os::unix::io;
 
+use image::{Rgba, RgbaImage};
+use nix::unistd;
+use rusttype::PositionedGlyph;
+use rusttype::{point, Font, Scale};
+use std::fs::File;
+use std::io;
+use std::os::unix::io::RawFd;
+use std::path::Path;
 extern crate nix;
 
 use midi::{Channel::Ch2, Message, U7};
-use nix::unistd;
 
 extern crate hex;
-extern crate png;
-
-
+// extern crate png;
+use base::maschine::ScreenInput;
 use base::{Maschine, MaschineButton, MaschineHandler, MaschinePad, MaschinePadStateTransition};
 
+// This is the left screen, the other index should be 0xE1
+const LCD_HEADER_BYTE: u8 = 0xE0;
+const LCD_FORMAT_BYTE: u8 = 0x08;
+const LCD_DATA_BYTE: u8 = 0x20;
 
+struct LcdData {
+    header: u8,
+    format: u8,
+    data: Vec<u8>,
+}
+
+impl LcdData {
+    fn new(data: Vec<u8>) -> Self {
+        LcdData {
+            header: LCD_HEADER_BYTE,
+            format: LCD_FORMAT_BYTE,
+            data,
+        }
+    }
+}
 const BUTTON_REPORT_TO_MIKROBUTTONS_MAP: [[Option<MaschineButton>; 8]; 23] = [
     [
         Some(MaschineButton::F8),
@@ -271,7 +294,7 @@ struct ButtonReport {
 }
 
 pub struct Mikro {
-    dev: io::RawFd,
+    dev: RawFd,
     light_buf: [u8; 49],
     light_buf2: [u8; 32],
     light_buf3: [u8; 57],
@@ -316,7 +339,7 @@ impl Mikro {
         ]
     }
 
-    pub fn new(dev: io::RawFd) -> Self {
+    pub fn new(dev: RawFd) -> Self {
         let mut _self = Mikro {
             dev: dev,
             light_buf: [0u8; 49],
@@ -409,6 +432,220 @@ impl Mikro {
             }
         }
     }
+
+    fn read_png_to_bytes_from_path(path: &str) -> io::Result<Vec<u8>> {
+        if !Path::new(path).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("File not found: {}", path),
+            ));
+        }
+
+        let mut limits = png::Limits::default();
+        limits.bytes = 10 * 1024;
+        let decoder = png::Decoder::new_with_limits(File::open(path)?, limits);
+        let mut reader = decoder.read_info()?;
+        let mut picture = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut picture)?;
+        Ok(picture[..info.buffer_size()].to_vec())
+    }
+
+    fn read_png_to_bytes_from_data(data: &str) -> io::Result<Vec<u8>> {
+        // Assuming the data is a base64 encoded PNG image
+        let decoded_data = base64::decode(data).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Base64 decoding error: {}", e),
+            )
+        })?;
+        let mut limits = png::Limits::default();
+        limits.bytes = 10 * 1024;
+        let decoder = png::Decoder::new_with_limits(&decoded_data[..], limits);
+        let mut reader = decoder.read_info()?;
+        let mut picture = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut picture)?;
+        Ok(picture[..info.buffer_size()].to_vec())
+    }
+
+    fn render_text_to_bitmap(
+        text: &str,
+        width: u32,
+        height: u32,
+        font_data: &[u8],
+        font_size: f32,
+    ) -> RgbaImage {
+        let font = Font::try_from_bytes(font_data).expect("Error constructing Font");
+        let scale = Scale::uniform(font_size);
+        let v_metrics = font.v_metrics(scale);
+        let offset = point(0.0, v_metrics.ascent);
+
+        let glyphs: Vec<PositionedGlyph> = font.layout(text, scale, offset).collect();
+
+        let mut image = RgbaImage::new(width, height);
+
+        let mut x_offset = 0u32;
+
+        for glyph in glyphs {
+            if let Some(bbox) = glyph.pixel_bounding_box() {
+                glyph.draw(|x, y, v| {
+                    let px = bbox.min.x as u32 + x as u32 + x_offset;
+                    let py = bbox.min.y as u32 + y as u32;
+                    if px < width && py < height {
+                        let pixel = image.get_pixel(px, py);
+                        let new_pixel = Rgba([pixel[0], pixel[1], pixel[2], (v * 255.0) as u8]);
+                        image.put_pixel(px, py, new_pixel);
+                    }
+                });
+                x_offset += bbox.width() as u32;
+            }
+        }
+
+        image
+    }
+
+    fn text_to_bytes(text: &str) -> Vec<u8> {
+        let font_data = include_bytes!("./DejaVuSansMono.ttf");
+        let width = 256;
+        let height = 64;
+        let font_size = 16.0;
+        let mut image = Mikro::render_text_to_bitmap(text, width, height, font_data, font_size);
+        for pixel in image.pixels_mut() {
+            *pixel = Rgba([255 - pixel[0], 255 - pixel[1], 255 - pixel[2], pixel[3]]);
+        }
+
+        let mut bytes = Vec::new();
+        for pixel in image.pixels() {
+            bytes.push(pixel[0]); // R
+            bytes.push(pixel[1]); // G
+            bytes.push(pixel[2]); // B
+            bytes.push(pixel[3]); // A
+        }
+
+        bytes
+    }
+
+    fn process_bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::with_capacity(bytes.len() / 8);
+        let mut buffer = [0; 8];
+        let mut buffer_index = 0;
+
+        for count in (0..bytes.len()).step_by(4) {
+            let c = 1 + count;
+            if c < bytes.len() - 3 && bytes[c] / 2 + bytes[c + 2] / 2 >= 128 {
+                buffer[buffer_index] = 1;
+            } else {
+                buffer[buffer_index] = 0;
+            }
+            buffer_index += 1;
+
+            if buffer_index == 8 {
+                let intval = buffer.iter().fold(0, |acc, &x| (acc << 1) | x);
+                bits.push(intval);
+                buffer_index = 0;
+            }
+        }
+
+        bits
+    }
+
+    fn write_lcd_data(&mut self, bits: &[u8]) -> io::Result<()> {
+        let mut screen_buf = [0u8; 1 + 8 + 512];
+        screen_buf[0] = LCD_HEADER_BYTE;
+        screen_buf[5] = LCD_FORMAT_BYTE;
+        screen_buf[7] = LCD_DATA_BYTE;
+
+        let mut screen_writer = 9;
+        let mut steps = 0;
+
+        for &bit in bits {
+            if screen_writer == 10 {
+                if steps <= 30 {
+                    screen_buf[1] += 1;
+                    steps += 1;
+                    screen_writer = 9;
+                } else {
+                    screen_buf[3] += 1;
+                    screen_buf[1] = 0;
+                    steps = 0;
+                    screen_writer = 9;
+                }
+            }
+            screen_buf[screen_writer] = bit;
+            unistd::write(self.dev, &screen_buf)?;
+            screen_writer += 1;
+        }
+
+        Ok(())
+    }
+
+    fn write_screen(&mut self, input: ScreenInput) {
+        let bytes = match input {
+            ScreenInput::FilePath(path) => match Mikro::read_png_to_bytes_from_path(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!("Error reading PNG file: {}", err);
+                    return;
+                }
+            },
+            ScreenInput::ImageData(data) => match Mikro::read_png_to_bytes_from_data(&data) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!("Error reading image data: {}", err);
+                    return;
+                }
+            },
+            ScreenInput::Text(text) => Mikro::text_to_bytes(&text),
+        };
+
+        let data = bytes;
+        let bits = Mikro::process_bytes_to_bits(&data);
+
+        if let Err(err) = Mikro::write_lcd_data(self, &bits) {
+            eprintln!("Error writing to screen: {}", err);
+        } else {
+            println!("RUNNING!");
+        }
+    }
+
+    fn write_lights(&mut self) {
+        unistd::write(self.dev, &self.light_buf).unwrap();
+        unistd::write(self.dev, &self.light_buf2).unwrap();
+        unistd::write(self.dev, &self.light_buf3).unwrap();
+    }
+
+    fn clear_screen(&mut self) {
+        let mut screen_buf = [0u8; 1 + 8 + 512];
+        let mut screen_buf2 = [0u8; 1 + 8 + 512];
+
+        screen_buf[0] = 0xE0;
+        screen_buf[5] = 0x08;
+        screen_buf[7] = 0x20;
+
+        screen_buf2[0] = 0xE1;
+        screen_buf2[5] = 0x08;
+        screen_buf2[7] = 0x20;
+
+        let mut k = 0;
+        let mut t = 0;
+        while k < 9 {
+            screen_buf[1] = k * 4;
+            screen_buf2[1] = k * 4;
+            k += 1;
+
+            if k == 8 {
+                screen_buf[3] = t * 4;
+                screen_buf2[3] = t * 4;
+                if t < 8 {
+                    k = 0;
+                }
+                t += 1;
+            }
+            unistd::write(self.dev, &screen_buf).unwrap();
+            unistd::write(self.dev, &screen_buf2).unwrap();
+        }
+
+        println!("Screen clear done?");
+    }
 }
 
 fn set_rgb_light(rgb: &mut [u8], color: u32, brightness: f32) {
@@ -420,29 +657,23 @@ fn set_rgb_light(rgb: &mut [u8], color: u32, brightness: f32) {
 }
 
 impl Maschine for Mikro {
-    fn get_fd(&self) -> io::RawFd {
-        return self.dev;
+    fn get_fd(&self) -> RawFd {
+        self.dev
     }
 
-    fn write_lights(&mut self) {
-        unistd::write(self.dev, &self.light_buf).unwrap();
-        unistd::write(self.dev, &self.light_buf2).unwrap();
-        unistd::write(self.dev, &self.light_buf3).unwrap();
+    fn get_pad_pressure(&self, pad_idx: usize) -> Result<f32, ()> {
+        match pad_idx {
+            0..=15 => Ok(self.pads[pad_idx].get_pressure()),
+            _ => Err(()),
+        }
     }
 
-    fn set_pad_light(&mut self, pad: usize, color: u32, brightness: f32) {
-        let offset = 1 + (pad * 3);
-        let rgb = &mut self.light_buf[offset..(offset + 3)];
-
-        set_rgb_light(rgb, color, brightness);
+    fn get_midi_note_base(&self) -> u8 {
+        self.midi_note_base
     }
 
     fn set_midi_note_base(&mut self, base: u8) {
         self.midi_note_base = base;
-    }
-
-    fn get_midi_note_base(&self) -> u8 {
-        return self.midi_note_base;
     }
 
     fn set_roller_state(&mut self, state: usize, idx: usize) {
@@ -450,91 +681,14 @@ impl Maschine for Mikro {
     }
 
     fn get_roller_state(&self, idx: usize) -> usize {
-        //println!("{}", self.roller_state[idx]);
-
-        return self.roller_state[idx];
+        self.roller_state[idx]
     }
 
-    fn set_mod(&mut self, state: usize) {
-        self.mod_state = state;
-    }
+    fn set_pad_light(&mut self, pad_idx: usize, color: u32, brightness: f32) {
+        let offset = 1 + (pad_idx * 3);
+        let rgb = &mut self.light_buf[offset..(offset + 3)];
 
-    fn get_mod(&self) -> usize {
-        return self.mod_state;
-    }
-
-    fn set_padmode(&mut self, state: usize) {
-        if self.padmode < 3 && state == 1 {
-            self.padmode += 1
-        } else {
-            self.padmode = 0;
-        };
-        println!("Padmode {}", self.padmode);
-        if self.padmode == 2 {
-            println!("This is Sequencer mode");
-            println!("");
-            println!("Tapping on pads activates them for the sequence.");
-            println!("Tapping on a pad while holding shift, then pressing another pad");
-            println!("will change the note of the pad you pressed first");
-        }
-    }
-
-    fn get_padmode(&self) -> usize {
-        return self.padmode;
-    }
-
-    fn set_playing(&mut self, state: usize) {
-        if state == 1 {
-            self.playing = true;
-        } else {
-            self.playing = false;
-        }
-    }
-
-    fn get_playing(&self) -> bool {
-        return self.playing;
-    }
-
-    fn note_save(&mut self, pad_idx: usize, note: u8, vel: u8) {
-        if self.noteset == true {
-            self.vel[self.noteidx] = vel;
-            self.note[self.noteidx] = note;
-            println!(
-                "step: {}, note:{}, velocity{}",
-                self.noteidx, self.note[self.noteidx], self.vel[self.noteidx]
-            );
-            self.noteset = false;
-        } else {
-            self.noteidx = pad_idx;
-            self.noteset = true;
-        };
-    }
-
-    fn note_state(&mut self, pad_idx: usize, msg: usize) {
-        self.note_state[pad_idx] = msg;
-    }
-
-    fn note_check(&self, pad_idx: usize) -> usize {
-        return self.note_state[pad_idx];
-    }
-
-    fn load_notes(&self, pad_idx: usize, context: usize) -> midi::Message {
-        if context == 1 {
-            let msg = Message::NoteOn(Ch2, self.note[pad_idx], self.vel[pad_idx]);
-            return msg;
-        } else {
-            let msg = Message::NoteOff(Ch2, self.note[pad_idx], self.vel[pad_idx]);
-            return msg;
-        }
-    }
-
-    fn set_seq_speed(&mut self, status: usize) {
-        self.speed = status as u64;
-        println!("sequencer rate: {}", self.speed);
-    }
-
-    fn get_seq_speed(&self) -> u64 {
-        return self.speed
+        set_rgb_light(rgb, color, brightness);
     }
 
     fn set_button_light(&mut self, btn: MaschineButton, _color: u32, brightness: f32) {
@@ -597,11 +751,86 @@ impl Maschine for Mikro {
             _ => return,
         };
         if idx != 0 {
-            //println!("light this {}, brightness {}", idx, brightness);
             self.light_buf2[idx] = brightness as u8;
         } else {
             self.light_buf3[idx2] = brightness as u8;
         }
+    }
+
+    fn set_mod(&mut self, state: usize) {
+        self.mod_state = state;
+    }
+
+    fn get_mod(&self) -> usize {
+        self.mod_state
+    }
+
+    fn note_state(&mut self, pad_idx: usize, msg: usize) {
+        self.note_state[pad_idx] = msg;
+    }
+
+    fn note_check(&self, pad_idx: usize) -> usize {
+        self.note_state[pad_idx]
+    }
+
+    fn note_save(&mut self, pad_idx: usize, note: u8, vel: u8) {
+        if self.noteset {
+            self.vel[self.noteidx] = vel;
+            self.note[self.noteidx] = note;
+            println!(
+                "step: {}, note:{}, velocity{}",
+                self.noteidx, self.note[self.noteidx], self.vel[self.noteidx]
+            );
+            self.noteset = false;
+        } else {
+            self.noteidx = pad_idx;
+            self.noteset = true;
+        }
+    }
+
+    fn load_notes(&self, pad_idx: usize, context: usize) -> Message {
+        if context == 1 {
+            Message::NoteOn(Ch2, self.note[pad_idx], self.vel[pad_idx])
+        } else {
+            Message::NoteOff(Ch2, self.note[pad_idx], self.vel[pad_idx])
+        }
+    }
+
+    fn set_seq_speed(&mut self, status: usize) {
+        self.speed = status as u64;
+        println!("sequencer rate: {}", self.speed);
+    }
+
+    fn get_seq_speed(&self) -> u64 {
+        self.speed
+    }
+
+    fn set_padmode(&mut self, state: usize) {
+        if self.padmode < 3 && state == 1 {
+            self.padmode += 1;
+        } else {
+            self.padmode = 0;
+        }
+        println!("Padmode {}", self.padmode);
+        if self.padmode == 2 {
+            println!("This is Sequencer mode");
+            println!("");
+            println!("Tapping on pads activates them for the sequence.");
+            println!("Tapping on a pad while holding shift, then pressing another pad");
+            println!("will change the note of the pad you pressed first");
+        }
+    }
+
+    fn get_padmode(&self) -> usize {
+        self.padmode
+    }
+
+    fn set_playing(&mut self, state: usize) {
+        self.playing = state == 1;
+    }
+
+    fn get_playing(&self) -> bool {
+        self.playing
     }
 
     fn readable(&mut self, handler: &mut dyn MaschineHandler) {
@@ -622,158 +851,15 @@ impl Maschine for Mikro {
         }
     }
 
-    fn get_pad_pressure(&self, pad_idx: usize) -> Result<f32, ()> {
-        match pad_idx {
-            0..=15 => Ok(self.pads[pad_idx].get_pressure()),
-            _ => Err(()),
-        }
-    }
-
     fn clear_screen(&mut self) {
-        let mut screen_buf = [0u8; 1 + 8 + 512];
-        let mut screen_buf2 = [0u8; 1 + 8 + 512];
-
-        screen_buf[0] = 0xE0;
-        //screen_buf[3] = 16;
-        screen_buf[5] = 0x08;
-        screen_buf[7] = 0x20;
-
-        //screen_buf[16] = 0xFF;
-
-        screen_buf2[0] = 0xE1;
-        //screen_buf2[3] = 16;
-        screen_buf2[5] = 0x08;
-        screen_buf2[7] = 0x20;
-
-        let mut k = 0;
-        let mut t = 0;
-        while k < 9 {
-            screen_buf[1] = k * 4;
-            screen_buf2[1] = k * 4;
-            k += 1;
-
-            if k == 8 {
-                screen_buf[3] = t * 4;
-                screen_buf2[3] = t * 4;
-                if t < 8 {
-                    k = 0;
-                }
-                t += 1;
-            }
-            unistd::write(self.dev, &screen_buf).unwrap();
-            unistd::write(self.dev, &screen_buf2).unwrap();
-        }
-
-        println!("Screen clear done?");
+        Mikro::clear_screen(self);
     }
 
-    fn write_screen(&mut self) {
-        let mut limits = png::Limits::default();
-        limits.bytes = 10 * 1024;
-        let decoder = png::Decoder::new_with_limits(File::open("picturetest.png").unwrap(), limits);
-        let mut reader = decoder.read_info().unwrap();
-        let mut picture = vec![0; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut picture).unwrap();
-        let bytes = &picture[..info.buffer_size()];
-        let mut screen_buf = [0u8; 1 + 8 + 512];
-        //println!("{}", bytes.len());
+    fn write_lights(&mut self) {
+        Mikro::write_lights(self);
+    }
 
-        //let mut screen_buf2 = [0u8; 1 + 8+ 512];
-        screen_buf[0] = 0xE0;
-        screen_buf[5] = 0x08;
-        screen_buf[7] = 0x20;
-
-        screen_buf[1] = 0;
-        screen_buf[3] = 0;
-
-        let mut screen_writer = 9;
-        let mut steps = 0;
-        let mut bits = [0u8; 4097];
-        let mut inc = 0;
-        let mut ok = 0;
-        let mut count2 = 0;
-
-        let mut a1 = 0;
-        let mut a2 = 0;
-        let mut a3 = 0;
-        let mut a4 = 0;
-        let mut a5 = 0;
-        let mut a6 = 0;
-        let mut a7 = 0;
-        let mut a8 = 0;
-
-        for count in 0..bytes.len() {
-            let c = 1 + 4 * count;
-            let mut swap = 0;
-            //if bytes[c] / 8 + bytes[c + 1] / 8  + bytes[c + 2] / 8 + bytes[c + 3] / 8  + bytes[c + 4] / 8  + bytes[c + 5] / 8  + bytes[c + 6] / 8  + bytes[c + 7] / 8 >= 32{
-            if c < bytes.len() - 3 {
-                if bytes[c] / 2 + bytes[c + 2] / 2 >= 128 {
-                    swap = 1;
-                } else {
-                    swap = 0;
-                }
-                //println!("{}", swap);
-            }
-            let mut binary = [0u8; 4097];
-            if c < 65534 {
-                //print!("{}, ", bytes[count]);
-                let intval;
-                match inc {
-                    0 => a1 = swap,
-                    1 => a2 = swap,
-                    2 => a3 = swap,
-                    3 => a4 = swap,
-                    4 => a5 = swap,
-                    5 => a6 = swap,
-                    6 => a7 = swap,
-                    7 => a8 = swap,
-                    _ => return,
-                }
-                inc += 1;
-                if inc == 8 {
-                    inc = 0;
-                }
-                ok += 1;
-                if ok == 8 {
-                    let combination = format!("{}{}{}{}{}{}{}{}", a1, a2, a3, a4, a5, a6, a7, a8);
-                    intval = usize::from_str_radix(&combination, 2).unwrap();
-                    ok = 0;
-                    binary[count2] = intval as u8;
-                    bits[count2] = binary[count2];
-                    count2 += 1;
-                    a1 = 0;
-                    a2 = 0;
-                    a3 = 0;
-                    a4 = 0;
-                    a5 = 0;
-                    a6 = 0;
-                    a7 = 0;
-                    a8 = 0;
-                }
-            }
-            //let intval = usize::from_str_radix(&combination, 4).unwrap();
-            //println!("{}", combination)
-        }
-
-        for a in 0..bits.len() {
-            if screen_writer == 10 {
-                if steps <= 30 {
-                    screen_buf[1] += 1;
-                    steps += 1;
-                    screen_writer = 9;
-                    screen_buf[screen_writer] = bits[a];
-                } else {
-                    screen_buf[3] += 1;
-                    screen_buf[1] = 0;
-                    steps = 0;
-                    screen_writer = 9;
-                    screen_buf[screen_writer] = bits[a];
-                }
-            }
-            //println!("{}", bits[a]);
-            unistd::write(self.dev, &screen_buf).unwrap();
-            screen_writer += 1;
-        }
-        println!("RUNNING!");
+    fn write_screen(&mut self, input: ScreenInput) {
+        Mikro::write_screen(self, input);
     }
 }

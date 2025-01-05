@@ -11,8 +11,11 @@ nix = "~0.7"
 hsl = "~0.1"
 midi = "*"
 tinyosc = "0.0.3"
-png = "0.17.13"
+png = "0.17.16"
 hex = "0.4.3"
+base64 = "0.13"
+rusttype = "0.9"
+image = "0.24"
 
 [dependencies.alsa-seq]
 path = "alsa-seq"

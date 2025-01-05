@@ -231,9 +231,14 @@ pub enum MaschineButton {
     P6,
     P7,
     P8,
-
-
 }
+
+pub enum ScreenInput {
+    FilePath(String),
+    ImageData(String),
+    Text(String),
+}
+
 pub trait Maschine {
     fn get_fd(&self) -> RawFd;
 
@@ -270,7 +275,7 @@ pub trait Maschine {
 
     fn clear_screen(&mut self);
     fn write_lights(&mut self);
-    fn write_screen(&mut self);
+    fn write_screen(&mut self, input: ScreenInput);
 }
 
 #[allow(unused_variables)]
@@ -281,8 +286,16 @@ pub trait MaschineHandler {
 
     fn encoder_step(&mut self, _: &mut dyn Maschine, encoder_idx: usize, delta: i32) {}
 
-    fn button_down(&mut self, _: &mut dyn Maschine, button: MaschineButton, byte: u8, is_down: bool) {}
-    fn button_up(&mut self, _: &mut dyn Maschine, button: MaschineButton, byte: u8, is_down: bool) {}
+    fn button_down(
+        &mut self,
+        _: &mut dyn Maschine,
+        button: MaschineButton,
+        byte: u8,
+        is_down: bool,
+    ) {
+    }
+    fn button_up(&mut self, _: &mut dyn Maschine, button: MaschineButton, byte: u8, is_down: bool) {
+    }
 
     fn read_input(&mut self, _: &mut dyn Maschine) {}
 }
